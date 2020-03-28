@@ -47,6 +47,8 @@ struct flb_file_conf {
     int rotate_duration;
     gzFile *gfp;
     struct flb_output_instance *ins;
+    char tmp_current_file_name[128];
+    char current_file_name[128];
 };
 
 
@@ -70,13 +72,14 @@ static int cb_klog_init(struct flb_output_instance *ins,
     ctx->rotate_duration = 0;
     ctx->last_file_creation = 0;
     ctx->gfp=NULL;
+    ctx->tmp_current_file_name[0]=0;
+    ctx->current_file_name[0]=0;
 
     ret = flb_output_config_map_set(ins, (void *) ctx);
     if (ret == -1) {
         flb_free(ctx);
         return -1;
     }
-
     tmp = flb_output_get_property("Rotate_Duration", ins);
     if (tmp) {
         ctx->rotate_duration = (int)strtof(tmp, NULL); 
@@ -113,7 +116,11 @@ static void close_file(struct flb_file_conf *ctx)
         if (gzclose(ctx->gfp) != Z_OK)  {
             flb_debug("[output] error closing gzip file");
         }
+        flb_debug("[output] rename file %s=>%s",ctx->tmp_current_file_name,ctx->current_file_name);
+        rename ( ctx->tmp_current_file_name,ctx->current_file_name );
 
+        ctx->current_file_name[0]=0;
+        ctx->tmp_current_file_name[0]=0;
         ctx->gfp=NULL;
     }
     ctx->last_file_creation=0;
@@ -134,12 +141,12 @@ static void open_file(struct flb_file_conf *ctx,const char* file_name_template)
     }
 
     if (!ctx->gfp) {
-        char file_name[1000];
         struct tm * timeinfo;
         timeinfo = localtime (&now);
-        strftime (file_name,sizeof(file_name),file_name_template,timeinfo);
-        ctx->gfp = (gzFile *)gzopen(file_name ,"wb4");
-        flb_debug("gzip file opened %s %p",file_name,ctx->gfp);
+        strftime (ctx->current_file_name,sizeof(ctx->current_file_name),file_name_template,timeinfo);
+        sprintf(ctx->tmp_current_file_name,"%s.tmp",ctx->current_file_name);
+        ctx->gfp = (gzFile *)gzopen(ctx->tmp_current_file_name ,"wb4");
+        flb_debug("gzip file opened %s %p",ctx->tmp_current_file_name,ctx->gfp);
         ctx->last_file_creation=now;
     }
 
