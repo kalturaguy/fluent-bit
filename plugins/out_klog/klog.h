@@ -21,4 +21,9 @@
 #ifndef FLB_OUT_KLOG
 #define FLB_OUT_KLOG
 
+#define FLB_KLOG_HASH_TABLE_SIZE 256
+
+#define KUBE_TAG_TO_REGEX "kube.var.log.containers.(?<pod_name>[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace_name>[^_]+)_(?<container_name>.+)-(?<docker_id>[a-z0-9]{64})\\.log$"
+
+
 #endif

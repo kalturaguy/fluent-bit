@@ -23,6 +23,7 @@
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_time.h>
+
 #include <msgpack.h>
 
 #include <stdio.h>
@@ -32,6 +33,7 @@
 
 #include "klog.h"
 #include <zlib.h>
+#include "hash.h"
 
 #ifdef FLB_SYSTEM_WINDOWS
 #define NEWLINE "\r\n"
@@ -41,15 +43,76 @@
 
 #define ZLIB_GZIP_ENCODING (16)
 
-struct flb_file_conf {
-    const char *out_file;
-    time_t last_file_creation;
+#define GZIP_CHUNK_SIZE 16384
+
+struct flb_klog_conf {
+    const char *out_file_template;
     int rotate_duration;
-    gzFile *gfp;
     struct flb_output_instance *ins;
+    struct flb_regex* tag_regex;
+    struct hash_t hash_table;
+};
+
+struct flb_klog_file_output_ctx {
     char tmp_current_file_name[128];
     char current_file_name[128];
+    unsigned char* out_buffer;
+    z_stream zstream;
+    FILE* file;
 };
+
+struct flb_klog_container_ctx {
+    struct flb_klog_file_output_ctx files[2];
+    time_t last_file_creation;
+    int rotate_duration;
+    char  pod_name[128];
+};
+
+
+static void cb_results(const char *name, const char *value,
+                       size_t vlen, void *data)
+{
+    struct flb_klog_container_ctx *ctx = data;
+
+    if (vlen == 0) {
+        return;
+    }
+    if (strcmp(name, "pod_name") == 0) {
+        memcpy(ctx->pod_name,value,vlen);
+        flb_debug("[cb_results] ctx=%p, podname=%s",ctx,ctx->pod_name);
+    }
+    return;
+}
+
+struct flb_klog_container_ctx* get_container_log(struct flb_klog_conf* ctx,const char* tag,int tag_len) {
+
+    struct flb_klog_container_ctx *container_ctx = NULL;
+
+    container_ctx=hash_lookup(&ctx->hash_table, tag);
+    if (container_ctx==NULL) {
+        flb_debug("[klog] [get_container_log] didn't find key %s in hash allocating",tag);
+        container_ctx = flb_calloc(1,sizeof(struct flb_klog_container_ctx));
+        if (!container_ctx) {
+            return NULL;
+        }
+        for (int i=0;i<2;i++) {
+            container_ctx->files[i].out_buffer=flb_malloc(GZIP_CHUNK_SIZE);
+        }
+        container_ctx->rotate_duration=ctx->rotate_duration;
+
+        struct flb_regex_search result;
+
+        flb_regex_do(ctx->tag_regex, tag, tag_len, &result);
+        flb_regex_parse(ctx->tag_regex, &result, cb_results, container_ctx);
+    
+        hash_insert(&ctx->hash_table,tag, tag_len, container_ctx);
+
+        flb_debug("[klog] [get_container_log] inserted instance %p  (pod=%s)",container_ctx, container_ctx->pod_name);
+    } else {
+        flb_debug("[klog] [get_container_log] found  key %s in hash - %p",tag,container_ctx);
+    }
+    return container_ctx;
+}
 
 
 static int cb_klog_init(struct flb_output_instance *ins,
@@ -58,22 +121,19 @@ static int cb_klog_init(struct flb_output_instance *ins,
 {
     int ret;
     const char *tmp;
-    char *ret_str;
     (void) config;
     (void) data;
-    struct flb_file_conf *ctx;
+    struct flb_klog_conf *ctx;
 
-    ctx = flb_calloc(1, sizeof(struct flb_file_conf));
+    ctx = flb_calloc(1, sizeof(struct flb_klog_conf));
     if (!ctx) {
         flb_errno();
         return -1;
     }
     ctx->ins = ins;
     ctx->rotate_duration = 0;
-    ctx->last_file_creation = 0;
-    ctx->gfp=NULL;
-    ctx->tmp_current_file_name[0]=0;
-    ctx->current_file_name[0]=0;
+    ctx->tag_regex=flb_regex_create(KUBE_TAG_TO_REGEX);
+    hash_init(&ctx->hash_table, 256);
 
     ret = flb_output_config_map_set(ins, (void *) ctx);
     if (ret == -1) {
@@ -88,46 +148,129 @@ static int cb_klog_init(struct flb_output_instance *ins,
 
     /* Set the context */
     flb_output_set_context(ins, ctx);
+    
+    flb_debug("[klog] cb_klog_init %p",ctx);
 
     return 0;
 }
 
-
-static int gzip_plain_output(gzFile *gfp, msgpack_object *obj, size_t alloc_size)
+static int write_gzip(struct flb_klog_file_output_ctx *ctx,char *buf,size_t len) 
 {
-    char *buf;
+    ctx->zstream.avail_in=len;
+    ctx->zstream.next_in=buf;
+    do {
+        ctx->zstream.avail_out = GZIP_CHUNK_SIZE;
+        ctx->zstream.next_out = ctx->out_buffer;
+        int flush = len==0 ? Z_FINISH : Z_NO_FLUSH;
+        int ret = deflate(&ctx->zstream, flush);    /* no bad return value */
+        assert(ret != Z_STREAM_ERROR);  /* state not clobbered */
+        int have = GZIP_CHUNK_SIZE - ctx->zstream.avail_out;
+        //flb_debug("[klog] write_gzip %p %d / %d %d %d bytes into file",ctx->file,have,len,flush, ctx->zstream.avail_out);
+        if (have>0) {
+            if (fwrite(ctx->out_buffer, 1, have, ctx->file) != have || ferror(ctx->file)) {
+                (void)deflateEnd(&ctx->zstream);
+                return Z_ERRNO;
+            }
+        } 
+    } while (ctx->zstream.avail_out == 0);
+    return Z_ERRNO;
+}
 
-    buf = flb_msgpack_to_json_str(alloc_size, obj);
-    if (buf) {
-        int len=strlen(buf);
-        int ret=gzwrite(gfp,buf,len);
-        flb_debug("[output] gzipped %d/%d bytes into %p",ret,len,gfp);
-        flb_free(buf);
+int find_next_quote(const char *source,int from,int len) {
+    for (int i=from;i<len;i++) {
+        if (source[i]=='\\') {
+            continue;
+        }
+        if (source[i]=='"')
+            return i+1;
+    }
+    return -1;
+}
+
+static int gzip_plain_output(struct flb_klog_container_ctx *ctx, msgpack_object *obj, size_t alloc_size)
+{
+    const char *buf=NULL;
+    int len=0;
+    msgpack_object_kv *kv;
+
+    for (int i = 0; i < obj->via.map.size; i++) {
+        kv = obj->via.map.ptr + i;
+        if (!strncmp(kv->key.via.str.ptr, "log", 3)) {
+            buf=kv->val.via.str.ptr;
+            len=kv->val.via.str.size;
+        }
+        //flb_debug("[klog] key=%s value=%s %d",kv->key.via.str.ptr,buf,len);
+    }
+
+    //buf = flb_msgpack_to_json_str(alloc_size, obj);
+    if (buf!=NULL) {
+        write_gzip(&ctx->files[0],buf,len);
+        //flb_debug("[klog] gzipped %d bytes into %p",len,ctx);
     }
     return 0;
 }
 
 
-static void close_file(struct flb_file_conf *ctx) 
-{    
-    if (ctx->gfp) {
-        flb_debug("[output] close gz %p",ctx->gfp);
-        gzflush(ctx->gfp,Z_FULL_FLUSH);
-        if (gzclose(ctx->gfp) != Z_OK)  {
-            flb_debug("[output] error closing gzip file");
-        }
-        flb_debug("[output] rename file %s=>%s",ctx->tmp_current_file_name,ctx->current_file_name);
+static void close_file(struct flb_klog_file_output_ctx *ctx) 
+{
+    if (ctx->file!=NULL) {
+        flb_debug("[klog] %p close gz %p (%s)",ctx,ctx->file,ctx->tmp_current_file_name);
+        write_gzip(ctx,NULL,0);
+        deflateEnd(&ctx->zstream);
+        fclose(ctx->file);
+        flb_debug("[klog] rename file %s=>%s",ctx->tmp_current_file_name,ctx->current_file_name);
         rename ( ctx->tmp_current_file_name,ctx->current_file_name );
 
         ctx->current_file_name[0]=0;
         ctx->tmp_current_file_name[0]=0;
-        ctx->gfp=NULL;
+        ctx->file   =NULL;
+    }
+}
+
+
+static void close_container_files(struct flb_klog_container_ctx *ctx) 
+{    
+    flb_debug("[klog] %p close_file",ctx);
+    for (int i=0;i<2;i++) {
+        close_file(&ctx->files[i]);
     }
     ctx->last_file_creation=0;
 }
 
 
-static void open_file(struct flb_file_conf *ctx,const char* file_name_template) 
+static bool open_file(struct flb_klog_file_output_ctx *ctx,const char* type,const char* file_name_template) 
+{
+    time_t now=time(NULL);
+
+    if (ctx->file==NULL) {
+        struct tm * timeinfo;
+        timeinfo = localtime (&now);
+        char tmp[1024];
+        strftime (tmp,sizeof(tmp),file_name_template,timeinfo);
+        sprintf(ctx->current_file_name,"%s-%s.gz",tmp,type);
+        sprintf(ctx->tmp_current_file_name,"%s.tmp",ctx->current_file_name);
+        memset(&ctx->zstream, 0, sizeof(z_stream));
+
+       // ctx->zstream.zalloc = flb_malloc;
+       // ctx->zstream.zfree = flb_free;
+       // ctx->zstream.avail_out = GZIP_CHUNK_SIZE;
+       /// ctx->zstream.next_out = ctx->out_buffer;
+        int rc = deflateInit2(&ctx->zstream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, MAX_WBITS | ZLIB_GZIP_ENCODING, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY);
+        if (rc != Z_OK)
+        {  
+            flb_warn("compressor_thread: deflateInit2 failed %d", rc);
+            return false;
+        }
+        ctx->file = fopen (ctx->tmp_current_file_name, "ab");
+        
+        //ctx->gfp = gzopen(ctx->tmp_current_file_name ,"wb4");
+        flb_debug("[klog] %p gzip file opened %s %p",ctx,ctx->tmp_current_file_name,ctx->file);
+    }
+    return true;
+
+}
+
+static bool open_containers_file(struct flb_klog_container_ctx *ctx,const char* file_name_template) 
 {
     time_t now=time(NULL);
     if (ctx->rotate_duration>0 && ctx->last_file_creation!=0) {
@@ -135,69 +278,50 @@ static void open_file(struct flb_file_conf *ctx,const char* file_name_template)
        t -= (t % ctx->rotate_duration);
        double diff_t = difftime(now, t);
        if (diff_t>ctx->rotate_duration) {        
-           flb_debug("rotate file!");
-           close_file(ctx);
+           flb_debug("[klog] rotate file! for ctx=%p",ctx);
+           close_container_files(ctx);
        }
     }
 
-    if (!ctx->gfp) {
-        struct tm * timeinfo;
-        timeinfo = localtime (&now);
-        strftime (ctx->current_file_name,sizeof(ctx->current_file_name),file_name_template,timeinfo);
-        sprintf(ctx->tmp_current_file_name,"%s.tmp",ctx->current_file_name);
-        ctx->gfp = (gzFile *)gzopen(ctx->tmp_current_file_name ,"wb4");
-        flb_debug("gzip file opened %s %p",ctx->tmp_current_file_name,ctx->gfp);
-        ctx->last_file_creation=now;
+    for (int i=0;i<2;i++) {
+        open_file(&ctx->files[i],i==0 ? "stdout" : "stderr",file_name_template);
     }
+    return true;
 
 }
+
+
+
 static void cb_klog_flush(const void *data, size_t bytes,
                           const char *tag, int tag_len,
                           struct flb_input_instance *i_ins,
                           void *out_context,
                           struct flb_config *config)
 {
-    int ret;
+
     msgpack_unpacked result;
     size_t off = 0;
     size_t last_off = 0;
     size_t alloc_size = 0;
-    size_t total;
-    const char *out_file;
-    char *buf;
-    char *tag_buf;
     msgpack_object *obj;
-    struct flb_file_conf *ctx = out_context;
+    struct flb_klog_conf *ctx = out_context;
     struct flb_time tm;
     (void) i_ins;
     (void) config;
 
     /* Set the right output */
-    if (!ctx->out_file) {
-        out_file = tag;
-    }
-    else {
-        out_file = ctx->out_file;
-    }
 
-    flb_debug("Output instace %p %s %s",ctx,out_file,tag);
+
+
+    struct flb_klog_container_ctx* container_ctx=get_container_log(ctx,tag,tag_len);
+
+    flb_debug("[klog] instance %p %p tag=%s",ctx,container_ctx,tag);
 
     /* Open output file with default name as the Tag */
-    open_file(ctx,out_file);
-    if (ctx->gfp == NULL) {
+    if (!open_containers_file(container_ctx,ctx->out_file_template)) {
         flb_errno();
         FLB_OUTPUT_RETURN(FLB_ERROR);
     }
-
-    tag_buf = flb_malloc(tag_len + 1);
-    if (!tag_buf) {
-        flb_errno();
-        close_file(ctx);
-        FLB_OUTPUT_RETURN(FLB_RETRY);
-    }
-    memcpy(tag_buf, tag, tag_len);
-    tag_buf[tag_len] = '\0';
-
 
     /*
      * Upon flush, for each array, lookup the time and the first field
@@ -206,29 +330,41 @@ static void cb_klog_flush(const void *data, size_t bytes,
     msgpack_unpacked_init(&result);
     while (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
         alloc_size = (off - last_off) + 128; /* JSON is larger than msgpack */
+        //flb_debug("[klog] msgpack_unpack_next %d %d %d %d",bytes,alloc_size,last_off,off);
         last_off = off;
 
         flb_time_pop_from_msgpack(&tm, &result, &obj);
-        gzip_plain_output(ctx->gfp, obj, alloc_size);           
+        gzip_plain_output(container_ctx, obj, alloc_size);           
     }
 
-    flb_free(tag_buf);
     msgpack_unpacked_destroy(&result);
 
     FLB_OUTPUT_RETURN(FLB_OK);
 }
+static void cb_delete_container_context(char* key,void *data) 
+{
+    struct flb_klog_container_ctx *ctx = data;
+    flb_debug("[klog] delete container context key=%s %p",key,ctx);
+    close_container_files(ctx);
+
+    flb_debug("[klog] ~delete container context key=%s %p",key,ctx);
+}
 
 static int cb_klog_exit(void *data, struct flb_config *config)
 {
-    struct flb_file_conf *ctx = data;
-
-    close_file(ctx);
+    struct flb_klog_conf *ctx = data;
 
     if (!ctx) {
         return 0;
     }
+    flb_debug("[klog] exit");
 
+    hash_destroy(&ctx->hash_table,cb_delete_container_context);
+
+    flb_regex_destroy(ctx->tag_regex);
     flb_free(ctx);
+    flb_debug("[klog] ~exit");
+
     return 0;
 }
 
@@ -236,7 +372,7 @@ static int cb_klog_exit(void *data, struct flb_config *config)
 static struct flb_config_map config_map[] = {
     {
      FLB_CONFIG_MAP_STR, "path", NULL,
-     0, FLB_TRUE, offsetof(struct flb_file_conf, out_file),
+     0, FLB_TRUE, offsetof(struct flb_klog_conf, out_file_template),
      NULL
     },
     {
